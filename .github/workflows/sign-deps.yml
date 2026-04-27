@@ -1,0 +1,77 @@
+name: trusted-signing-deps
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  reproduce:
+    name: reproduce broken sign install
+    runs-on: windows-2025
+    env:
+      AZURE_CORE_OUTPUT: none
+    steps:
+      - name: dotnet info
+        shell: pwsh
+        run: |
+          dotnet --info
+          dotnet nuget list source
+
+      - name: direct dotnet tool install via v3 source
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP "sign-v3"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          dotnet tool install sign `
+            --version 0.9.1-beta.24469.1 `
+            --tool-path $dest `
+            --add-source https://api.nuget.org/v3/index.json
+          Write-Host "exit=$LASTEXITCODE"
+          Get-ChildItem -Recurse $dest | Select-Object -First 50
+
+      - name: direct dotnet tool install via v2 source (matches module behavior)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP "sign-v2"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          dotnet tool install sign `
+            --version 0.9.1-beta.24469.1 `
+            --tool-path $dest `
+            --add-source https://www.nuget.org/api/v2/
+          Write-Host "exit=$LASTEXITCODE"
+
+      - name: direct dotnet tool install with source NAME (replicates module bug)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP "sign-name"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          dotnet tool install sign `
+            --version 0.9.1-beta.24469.1 `
+            --tool-path $dest `
+            --add-source nuget.org
+          Write-Host "exit=$LASTEXITCODE"
+
+      - name: install TrustedSigning module 0.5.8
+        shell: pwsh
+        run: |
+          Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Force -Repository PSGallery
+          Get-Module -ListAvailable TrustedSigning
+
+      - name: dump module's NugetInstall.psm1
+        shell: pwsh
+        run: |
+          $modulePath = (Get-Module -ListAvailable TrustedSigning).ModuleBase
+          Write-Host "ModuleBase: $modulePath"
+          Get-Content (Join-Path $modulePath "NugetInstall\NugetInstall.psm1") | Select-Object -First 200
+
+      - name: invoke Get-EveryDependency directly (no signing creds needed)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $modulePath = (Get-Module -ListAvailable TrustedSigning).ModuleBase
+          Import-Module (Join-Path $modulePath "NugetInstall\NugetInstall.psm1") -Force
+          $InformationPreference = 'Continue'
+          Get-EveryDependency
