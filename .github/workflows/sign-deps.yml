@@ -4,74 +4,129 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  TRUSTED_SIGNING_MODULE_VERSION: 0.5.8
+  BUILD_TOOLS_NUGET_VERSION: 10.0.26100.4188
+  TRUSTED_SIGNING_NUGET_VERSION: 1.0.95
+  DOTNET_SIGNCLI_NUGET_VERSION: 0.9.1-beta.24469.1
+
 jobs:
-  reproduce:
-    name: reproduce broken sign install
+  pre-install:
+    name: pre-install + verify module skips install
     runs-on: windows-2025
     env:
       AZURE_CORE_OUTPUT: none
     steps:
-      - name: dotnet info
+      - name: resolve PSModulePath
+        id: paths
         shell: pwsh
         run: |
-          dotnet --info
-          dotnet nuget list source
+          $defaultPath = $env:PSModulePath -split ';' | Select-Object -First 1
+          "psmodulepath=$defaultPath" >> $env:GITHUB_OUTPUT
 
-      - name: direct dotnet tool install via v3 source
+      - name: cache TrustedSigning module
+        id: cache_module
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.paths.outputs.psmodulepath }}\TrustedSigning\${{ env.TRUSTED_SIGNING_MODULE_VERSION }}
+          key: TrustedSigning-${{ env.TRUSTED_SIGNING_MODULE_VERSION }}
+
+      - name: cache Microsoft.Windows.SDK.BuildTools nuget
+        id: cache_buildtools
+        uses: actions/cache@v5
+        with:
+          path: ~\AppData\Local\TrustedSigning\Microsoft.Windows.SDK.BuildTools\Microsoft.Windows.SDK.BuildTools.${{ env.BUILD_TOOLS_NUGET_VERSION }}
+          key: Microsoft.Windows.SDK.BuildTools-${{ env.BUILD_TOOLS_NUGET_VERSION }}
+
+      - name: cache Microsoft.Trusted.Signing.Client nuget
+        id: cache_tsclient
+        uses: actions/cache@v5
+        with:
+          path: ~\AppData\Local\TrustedSigning\Microsoft.Trusted.Signing.Client\Microsoft.Trusted.Signing.Client.${{ env.TRUSTED_SIGNING_NUGET_VERSION }}
+          key: Microsoft.Trusted.Signing.Client-${{ env.TRUSTED_SIGNING_NUGET_VERSION }}
+
+      - name: cache sign dotnet tool
+        id: cache_signcli
+        uses: actions/cache@v5
+        with:
+          path: ~\AppData\Local\TrustedSigning\sign\sign.${{ env.DOTNET_SIGNCLI_NUGET_VERSION }}
+          key: SignCli-${{ env.DOTNET_SIGNCLI_NUGET_VERSION }}
+
+      - name: install TrustedSigning module
+        if: steps.cache_module.outputs.cache-hit != 'true'
         shell: pwsh
-        continue-on-error: true
         run: |
-          $dest = Join-Path $env:RUNNER_TEMP "sign-v3"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          dotnet tool install sign `
-            --version 0.9.1-beta.24469.1 `
-            --tool-path $dest `
+          Install-Module -Name TrustedSigning -RequiredVersion $env:TRUSTED_SIGNING_MODULE_VERSION -Force -Repository PSGallery
+
+      - name: install Microsoft.Windows.SDK.BuildTools nuget
+        if: steps.cache_buildtools.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "Microsoft.Windows.SDK.BuildTools"
+          $version = $env:BUILD_TOOLS_NUGET_VERSION
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          if (-Not (Get-PackageSource -Location "https://www.nuget.org/api/v2/" -ErrorAction Ignore)) {
+            Register-PackageSource -Name trusted-signing-ps -Location "https://www.nuget.org/api/v2/" -ProviderName NuGet -Trusted -Force | Out-Null
+          }
+          Install-Package -Name $name -RequiredVersion $version -Source "https://www.nuget.org/api/v2/" -Destination $root -Force | Out-Null
+          Get-ChildItem $root
+
+      - name: install Microsoft.Trusted.Signing.Client nuget
+        if: steps.cache_tsclient.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "Microsoft.Trusted.Signing.Client"
+          $version = $env:TRUSTED_SIGNING_NUGET_VERSION
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          if (-Not (Get-PackageSource -Location "https://www.nuget.org/api/v2/" -ErrorAction Ignore)) {
+            Register-PackageSource -Name trusted-signing-ps -Location "https://www.nuget.org/api/v2/" -ProviderName NuGet -Trusted -Force | Out-Null
+          }
+          Install-Package -Name $name -RequiredVersion $version -Source "https://www.nuget.org/api/v2/" -Destination $root -Force | Out-Null
+          Get-ChildItem $root
+
+      - name: install sign dotnet tool
+        if: steps.cache_signcli.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "sign"
+          $version = $env:DOTNET_SIGNCLI_NUGET_VERSION
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          # mimic the layout that TrustedSigning/NugetInstall.psm1 expects:
+          # $root\sign.<version>\tools\net8.0\any\
+          dotnet tool install $name `
+            --version $version `
+            --tool-path $root `
             --add-source https://api.nuget.org/v3/index.json
-          Write-Host "exit=$LASTEXITCODE"
-          Get-ChildItem -Recurse $dest | Select-Object -First 50
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install failed: $LASTEXITCODE" }
+          $storePath = Join-Path $root ".store\$name\$version\$name\$version"
+          $packagePath = Join-Path $root "$name.$version"
+          Move-Item -Path $storePath -Destination $packagePath -Force
+          Remove-Item -Path (Join-Path $root ".store") -Recurse -Force
+          Remove-Item -Path (Join-Path $root "sign.exe") -Force -ErrorAction Ignore
+          Get-ChildItem -Recurse $packagePath | Select-Object -First 30
 
-      - name: direct dotnet tool install via v2 source (matches module behavior)
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $dest = Join-Path $env:RUNNER_TEMP "sign-v2"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          dotnet tool install sign `
-            --version 0.9.1-beta.24469.1 `
-            --tool-path $dest `
-            --add-source https://www.nuget.org/api/v2/
-          Write-Host "exit=$LASTEXITCODE"
-
-      - name: direct dotnet tool install with source NAME (replicates module bug)
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $dest = Join-Path $env:RUNNER_TEMP "sign-name"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          dotnet tool install sign `
-            --version 0.9.1-beta.24469.1 `
-            --tool-path $dest `
-            --add-source nuget.org
-          Write-Host "exit=$LASTEXITCODE"
-
-      - name: install TrustedSigning module 0.5.8
-        shell: pwsh
-        run: |
-          Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Force -Repository PSGallery
-          Get-Module -ListAvailable TrustedSigning
-
-      - name: dump module's NugetInstall.psm1
+      - name: verify module sees all deps installed (no install attempt)
         shell: pwsh
         run: |
           $modulePath = (Get-Module -ListAvailable TrustedSigning).ModuleBase
           Write-Host "ModuleBase: $modulePath"
-          Get-Content (Join-Path $modulePath "NugetInstall\NugetInstall.psm1") | Select-Object -First 200
-
-      - name: invoke Get-EveryDependency directly (no signing creds needed)
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $modulePath = (Get-Module -ListAvailable TrustedSigning).ModuleBase
           Import-Module (Join-Path $modulePath "NugetInstall\NugetInstall.psm1") -Force
           $InformationPreference = 'Continue'
-          Get-EveryDependency
+          $result = Get-EveryDependency
+          $result | Format-List
+          # Confirm each path exists.
+          foreach ($key in @('DlibFolderPath','SignToolFolderPath','SignCliFolderPath')) {
+            if (-Not (Test-Path $result[$key])) {
+              throw "Missing $key path: $($result[$key])"
+            }
+          }
+          Write-Host "OK: all dependency paths exist on disk."
+
+      - name: list cached layout
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Depth 4 (Join-Path $env:LOCALAPPDATA "TrustedSigning") |
+            Select-Object FullName -First 80
